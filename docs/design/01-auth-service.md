@@ -3,8 +3,8 @@
 > Identity, token issuance, and authorization source of truth.
 > Read [Platform Conventions](./00-platform-conventions.md) first.
 
-**Status:** Draft · **Runtime:** .NET 10 / ASP.NET Core
-**Owns:** users, external identities, roles, workspace membership, tokens
+**Status:** Draft · **Runtime:** Python 3.13+ / FastAPI (Uvicorn)
+**Owns:** users, external identities, roles, workspace membership, tokens, service clients
 **Depends on:** PostgreSQL (own DB), Redis Cache (R1)
 
 ---
@@ -18,6 +18,8 @@ The Auth Service is the identity provider and authorization source of truth for 
 - Federation with external identity providers via **OpenID Connect** (internal SSO) and
   optionally **SAML 2.0** (enterprise federation).
 - Issuance, refresh, and revocation of CollabHub access/refresh tokens (JWTs).
+- Service-client credentials and the `client_credentials` grant for internal callers
+  (Conventions §5.1).
 - The JWKS endpoint that all other services use to verify tokens.
 - Workspace membership and workspace-level roles (`owner`/`admin`/`member`/`guest`).
 
@@ -29,53 +31,71 @@ The Auth Service is the identity provider and authorization source of truth for 
 
 ## 2. Runtime & Dependencies
 
-- ASP.NET Core minimal APIs or controllers.
-- `Microsoft.AspNetCore.Authentication.OpenIdConnect`, `Sustainsys.Saml2` (or equivalent) for SAML.
-- `Microsoft.IdentityModel.Tokens` / `System.IdentityModel.Tokens.Jwt` for signing.
-- EF Core + Npgsql for PostgreSQL.
-- StackExchange.Redis for the R1 denylist + token cache.
+- FastAPI routers (async), Pydantic v2 models.
+- **Authlib** (Starlette/httpx integration) as the OIDC relying party for external IdPs.
+- **python3-saml** (OneLogin) or **pysaml2** for SAML, if SAML is in scope (D6). Both depend on
+  `xmlsec`/libxml2 native libraries — bake them into the image.
+- **PyJWT** (`pyjwt[crypto]`, backed by `cryptography`) for RS256 signing and JWKS generation.
+- SQLAlchemy 2.0 async + `asyncpg`; Alembic migrations.
+- `redis.asyncio` for the R1 denylist + profile cache.
 - Signing keys: RSA key pair stored as a secret; supports key rotation (multiple `kid`s,
   one active for signing, several valid for verification).
+- OAuth server-side state for login (`state`, `nonce`, PKCE verifier toward the upstream IdP)
+  is held in a signed, short-lived cookie (Starlette `SessionMiddleware`) or R1 — not in process
+  memory, since any pod may receive the callback.
 
 ---
 
 ## 3. Public Interface (REST)
 
-Base path `/api/v1`. Token endpoints and JWKS are unauthenticated; all others require Bearer.
+Business endpoints live under `/api/v1`; discovery endpoints live at the root
+(Conventions §4). Token, login/callback and well-known endpoints are unauthenticated; all
+others require Bearer.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | GET | `/.well-known/jwks.json` | none | Public verification keys (JWKS). |
-| GET | `/.well-known/openid-configuration` | none | OIDC discovery (if acting as OP). |
-| GET | `/auth/login/{provider}` | none | Begin external OIDC/SAML login (redirect). |
-| GET | `/auth/callback/{provider}` | none | Provider callback; establishes identity, redirects to SPA with auth code. |
-| POST | `/auth/token` | none | Exchange auth code (PKCE) for access + refresh tokens. |
-| POST | `/auth/refresh` | none | Rotate refresh token → new access + refresh. |
-| POST | `/auth/logout` | Bearer | Revoke current token's `jti` + refresh token. |
-| GET | `/auth/userinfo` | Bearer | Claims for the current token. |
-| GET | `/users/me` | Bearer | Current user profile. |
-| PATCH | `/users/me` | Bearer | Update own profile (display name, avatar ref). |
-| GET | `/users/{id}` | Bearer | Public profile of a user (name, avatar). |
-| GET | `/workspaces/{id}/members` | Bearer (member) | List members + roles. |
-| POST | `/workspaces/{id}/members` | Bearer (admin) | Invite/add member. |
-| PATCH | `/workspaces/{id}/members/{userId}` | Bearer (admin) | Change role. |
-| DELETE | `/workspaces/{id}/members/{userId}` | Bearer (admin) | Remove member. |
+| GET | `/.well-known/openid-configuration` | none | OIDC discovery (if acting as OP — D5). |
+| GET | `/api/v1/auth/login/{provider}` | none | Begin external OIDC/SAML login (redirect). |
+| GET/POST | `/api/v1/auth/callback/{provider}` | none | Provider callback (GET for OIDC, POST for SAML ACS); establishes identity, redirects to SPA with auth code. |
+| POST | `/api/v1/auth/token` | none / client secret | Exchange auth code (PKCE) for tokens; or `client_credentials` for service tokens. |
+| POST | `/api/v1/auth/refresh` | none | Rotate refresh token → new access + refresh. |
+| POST | `/api/v1/auth/logout` | Bearer | Revoke current token's `jti` + refresh-token family. |
+| GET | `/api/v1/auth/userinfo` | Bearer | Claims for the current token. |
+| GET | `/api/v1/users/me` | Bearer | Current user profile. |
+| PATCH | `/api/v1/users/me` | Bearer | Update own profile (display name, avatar ref). |
+| GET | `/api/v1/users/{id}` | Bearer | Public profile of a user (name, avatar). |
+| GET | `/api/v1/workspaces/{id}/members` | Bearer (member) | List members + roles. |
+| POST | `/api/v1/workspaces/{id}/members` | Bearer (admin) | Invite/add member. |
+| PATCH | `/api/v1/workspaces/{id}/members/{userId}` | Bearer (admin) | Change role. |
+| DELETE | `/api/v1/workspaces/{id}/members/{userId}` | Bearer (admin) | Remove member. |
 
 ### 3.1 Token endpoint payloads
 
-`POST /auth/token`
+Field names here are snake_case because RFC 6749 defines them (exception to the camelCase
+rule in Conventions §4).
+
+`POST /api/v1/auth/token` (authorization code)
 ```json
 // request
-{ "grant_type": "authorization_code", "code": "...", "code_verifier": "..." }
+{ "grant_type": "authorization_code", "code": "...", "code_verifier": "...", "redirect_uri": "..." }
 // response
 { "access_token": "ey...", "refresh_token": "def...", "token_type": "Bearer", "expires_in": 900 }
 ```
 
-`POST /auth/refresh`
+`POST /api/v1/auth/token` (service token)
 ```json
 // request
+{ "grant_type": "client_credentials", "client_id": "worker", "client_secret": "..." }
+// response — no refresh_token
+{ "access_token": "ey...", "token_type": "Bearer", "expires_in": 900 }
+```
+
+`POST /api/v1/auth/refresh`
+```json
+// request (omit the body field if the refresh token is sent as an HttpOnly cookie — D22)
 { "refresh_token": "def..." }
-// response — same shape as /auth/token; old refresh_token is now invalid (rotation)
+// response — same shape as the authorization-code response; old refresh_token is now invalid
 ```
 
 Access-token claims follow Conventions §5.1. The Auth Service is the only issuer.
@@ -85,6 +105,8 @@ Access-token claims follow Conventions §5.1. The Auth Service is the only issue
 ## 4. Data Model (PostgreSQL)
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS citext;
+
 CREATE TABLE users (
     id            uuid PRIMARY KEY,
     email         citext NOT NULL UNIQUE,
@@ -123,35 +145,51 @@ CREATE TABLE workspace_members (
 
 -- Refresh tokens are persisted (rotation + revocation). Access tokens are NOT stored.
 CREATE TABLE refresh_tokens (
-    id            uuid PRIMARY KEY,          -- the token's jti family root
+    id            uuid PRIMARY KEY,
+    family_id     uuid NOT NULL,             -- shared by every token in one rotation chain (= id of the first)
     user_id       uuid NOT NULL REFERENCES users(id),
-    token_hash    bytea NOT NULL,            -- SHA-256 of the opaque refresh token
+    token_hash    bytea NOT NULL UNIQUE,     -- SHA-256 of the opaque refresh token
     issued_at     timestamptz NOT NULL DEFAULT now(),
     expires_at    timestamptz NOT NULL,
     rotated_to    uuid NULL REFERENCES refresh_tokens(id),  -- set when rotated
     revoked_at    timestamptz NULL
 );
-CREATE INDEX ix_refresh_user ON refresh_tokens (user_id) WHERE revoked_at IS NULL;
+CREATE INDEX ix_refresh_user   ON refresh_tokens (user_id)   WHERE revoked_at IS NULL;
+CREATE INDEX ix_refresh_family ON refresh_tokens (family_id) WHERE revoked_at IS NULL;
+
+-- Internal service clients for the client_credentials grant.
+CREATE TABLE service_clients (
+    client_id     text PRIMARY KEY,          -- 'worker', ...
+    secret_hash   text NOT NULL,             -- argon2id hash (argon2-cffi)
+    roles         text[] NOT NULL DEFAULT '{service}',
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    disabled_at   timestamptz NULL
+);
 ```
 
 ### 4.1 Redis (R1) usage
 - `auth:revoked:{jti}` → `"1"`, TTL = remaining access-token lifetime. Written on logout.
 - `auth:userinfo:{userId}` → cached profile blob, short TTL, to speed up `/userinfo`.
+- `auth:login:{state}` → upstream-IdP login state (if not using a signed cookie), TTL ~10 min.
 
 ---
 
 ## 5. Internal Design
 
 ### 5.1 Login flow (OIDC, PKCE)
-1. SPA hits `/auth/login/{provider}` → 302 to external IdP.
-2. IdP redirects to `/auth/callback/{provider}`; service validates, upserts `users` +
-   `external_identities`, then redirects to the SPA redirect URI with a short-lived auth code.
-3. SPA calls `/auth/token` with the code + PKCE `code_verifier` → access + refresh tokens.
+1. SPA hits `/api/v1/auth/login/{provider}` → 302 to external IdP (Authlib `authorize_redirect`).
+2. IdP redirects to `/api/v1/auth/callback/{provider}`; service validates (Authlib
+   `authorize_access_token`, ID-token signature + `nonce`), upserts `users` +
+   `external_identities`, then redirects to the SPA redirect URI with a short-lived,
+   single-use auth code (stored in R1, bound to the SPA's PKCE `code_challenge`).
+3. SPA calls `/api/v1/auth/token` with the code + PKCE `code_verifier` → access + refresh tokens.
 
 ### 5.2 Refresh rotation
-On `/auth/refresh`: look up by `token_hash`, ensure not revoked/expired, mint a new pair,
-set `rotated_to` and `revoked_at` on the old row (reuse of a rotated token ⇒ revoke the whole
-family and 401 — detects token theft).
+On `/auth/refresh`: look up by `token_hash`, ensure not revoked/expired, mint a new pair in the
+same `family_id`, set `rotated_to` and `revoked_at` on the old row — in one transaction with
+`SELECT ... FOR UPDATE` so two concurrent refreshes cannot both succeed. Presenting an
+already-rotated token ⇒ revoke every row in its `family_id` and return 401 (token-theft
+detection).
 
 ### 5.3 Token verification (for other services)
 Other services do NOT call this service per request. They fetch JWKS and verify locally
@@ -165,26 +203,29 @@ Common vars per Conventions §8, plus:
 
 | Var | Notes |
 |-----|-------|
-| `Auth__SigningKey` | PEM RSA private key (secret). Active `kid`. |
-| `Auth__PreviousKeys` | Prior public keys still valid for verification (rotation). |
-| `Auth__AccessTokenMinutes` | Default 15. |
-| `Auth__RefreshTokenDays` | Default 30. |
-| `Oidc__{provider}__Authority` / `__ClientId` / `__ClientSecret` | Per external IdP. |
-| `Saml__{provider}__MetadataUrl` | Per SAML IdP. |
-| `Spa__RedirectUri` | Allowed post-login redirect. |
+| `AUTH__SIGNING_KEY` | PEM RSA private key (secret). Active `kid`. |
+| `AUTH__PREVIOUS_KEYS` | Prior public keys still valid for verification (rotation). |
+| `AUTH__ACCESS_TOKEN_MINUTES` | Default 15. |
+| `AUTH__REFRESH_TOKEN_DAYS` | Default 30. |
+| `AUTH__SESSION_SECRET` | Secret for the signed login-state cookie. |
+| `OIDC__<PROVIDER>__AUTHORITY` / `__CLIENT_ID` / `__CLIENT_SECRET` | Per external IdP. |
+| `SAML__<PROVIDER>__METADATA_URL` | Per SAML IdP. |
+| `SPA__REDIRECT_URI` | Allowed post-login redirect. |
 
 ---
 
 ## 7. Cross-Cutting
 Error envelope, health checks, observability, logging per Conventions §4.2, §9, §10.
-Emit metric `auth_tokens_issued_total`, `auth_logins_total{provider}`, `auth_refresh_reuse_total`.
+Emit metrics `auth_tokens_issued_total`, `auth_logins_total{provider}`, `auth_refresh_reuse_total`.
 
 ---
 
 ## 8. Non-Functional & Limits
-- Token issuance p99 < 100 ms.
+- Token issuance p99 < 100 ms. RSA signing is CPU-bound but sub-millisecond for 2048-bit keys;
+  it can run inline on the event loop.
 - JWKS cacheable (`Cache-Control`), so verification scales without hitting this service.
-- Rate-limit `/auth/token` and `/auth/refresh` per IP + per user.
+- Rate-limit `/auth/token` and `/auth/refresh` per IP + per user (R1-backed limiter, e.g.
+  `limits` with a Redis storage, or at the ingress).
 
 ---
 
